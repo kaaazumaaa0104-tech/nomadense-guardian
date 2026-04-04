@@ -1,89 +1,80 @@
-name: NOMADENSE 全クライアントBot 監視・自動復旧
+name: NOMADENSE Guardian
 
 on:
   schedule:
-    - cron: '*/15 * * * *'  # 15分毎（無料枠内: ~1,440分/月）
-  workflow_dispatch:          # 手動実行も可
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
 
 jobs:
   healthcheck:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-
-    # ─── クライアント一覧 ────────────────────────────────────────────────
-    # 新規クライアント追加時: 下記 matrix に1エントリ追加するだけ
     strategy:
-      fail-fast: false   # 1クライアントが失敗しても他のチェックを続ける
+      fail-fast: false
       matrix:
         client:
-          - name: よしこBot（ミライ工務店）
+          - name: yoshiko-mirai
+            label: "よしこBot（ミライ工務店）"
             url: https://outstanding-illumination-production-3225.up.railway.app
             railway_service: outstanding-illumination
-
-          # ─── 次のクライアント追加例 ───────────────────────────────────
-          # - name: 〇〇Bot（△△会社）
-          #   url: https://your-railway-url.up.railway.app
+          # 新クライアント追加例:
+          # - name: bot-client2
+          #   label: "XXBot（YY会社）"
+          #   url: https://your-service.up.railway.app
           #   railway_service: your-service-name
 
     steps:
-      - name: "${{ matrix.client.name }} ヘルスチェック"
+      - name: Health check
         id: check
         run: |
           HTTP_CODE=$(curl -s -o /tmp/health_body.txt -w "%{http_code}" \
             --max-time 20 "${{ matrix.client.url }}/healthz/deep" || echo "000")
           echo "http_code=$HTTP_CODE" >> $GITHUB_OUTPUT
-          echo "[${{ matrix.client.name }}] HTTP: $HTTP_CODE"
+          echo "client=${{ matrix.client.label }}" >> $GITHUB_OUTPUT
+          echo "[[${{ matrix.client.name }}]] HTTP: $HTTP_CODE"
           cat /tmp/health_body.txt
 
-      - name: 正常 → 終了
+      - name: All good
         if: steps.check.outputs.http_code == '200'
-        run: echo "✅ ${{ matrix.client.name }} 正常"
+        run: echo "OK - ${{ matrix.client.label }}"
 
-      # ─── 以下は障害時のみ ─────────────────────────────────────────────
-
-      - name: Railway CLI インストール
+      - name: Install Railway CLI
         if: steps.check.outputs.http_code != '200'
         run: |
           curl -fsSL https://railway.app/install.sh | sh
           echo "$HOME/.railway/bin" >> $GITHUB_PATH
 
-      - name: Railway 強制再デプロイ
+      - name: Railway redeploy
         if: steps.check.outputs.http_code != '200'
-        run: |
-          railway redeploy \
-            --service "${{ matrix.client.railway_service }}" \
-            --yes 2>&1
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          railway redeploy --service "${{ matrix.client.railway_service }}" --yes 2>&1
 
-      - name: 才木さんへ障害通知
+      - name: Notify failure + redeploy
         if: steps.check.outputs.http_code != '200'
         run: |
           ERRORS=$(python3 -c "
           import json
           try:
               d = json.load(open('/tmp/health_body.txt'))
-              print(', '.join(d.get('errors', ['不明なエラー'])))
+              print(', '.join(d.get('errors', ['unknown error'])))
           except Exception:
-              print('応答なし')
-          " 2>/dev/null || echo "応答なし")
-          MSG="⚠️ ${{ matrix.client.name }} 障害検知
-
-エラー: ${ERRORS}
-HTTP: ${{ steps.check.outputs.http_code }}
-
-Railway 再デプロイ実行済み。
-3分後に復旧確認します。"
+              print('no response')
+          " 2>/dev/null || echo "no response")
+          CLIENT="${{ matrix.client.label }}"
+          CODE="${{ steps.check.outputs.http_code }}"
+          MSG="${CLIENT} 障害検知 -> 自動復旧中\nエラー: ${ERRORS}\nHTTP: ${CODE}\nRailway再デプロイ実行済み。3分後に復旧確認します。"
           curl -s -X POST https://api.line.me/v2/bot/message/push \
             -H "Authorization: Bearer ${{ secrets.MONITORING_LINE_TOKEN }}" \
             -H "Content-Type: application/json" \
-            -d "{\"to\":\"${{ secrets.SAIKI_LINE_UID }}\",\"messages\":[{\"type\":\"text\",\"text\":\"$MSG\"}]}"
+            -d "{\"to\":\"${{ secrets.SAIKI_LINE_UID }}\",\"messages\":[{\"type\":\"text\",\"text\":\"${MSG}\"}]}"
 
-      - name: 3分待機
+      - name: Wait 3 min
         if: steps.check.outputs.http_code != '200'
         run: sleep 180
 
-      - name: 復旧確認
+      - name: Recovery check
         if: steps.check.outputs.http_code != '200'
         id: recovery
         run: |
@@ -92,27 +83,23 @@ Railway 再デプロイ実行済み。
           echo "http_code=$HTTP_CODE" >> $GITHUB_OUTPUT
           echo "Recovery: $HTTP_CODE"
 
-      - name: 復旧成功通知
-        if: >
-          steps.check.outputs.http_code != '200' &&
-          steps.recovery.outputs.http_code == '200'
+      - name: Notify recovered
+        if: steps.check.outputs.http_code != '200' && steps.recovery.outputs.http_code == '200'
         run: |
+          CLIENT="${{ matrix.client.label }}"
           curl -s -X POST https://api.line.me/v2/bot/message/push \
             -H "Authorization: Bearer ${{ secrets.MONITORING_LINE_TOKEN }}" \
             -H "Content-Type: application/json" \
-            -d "{\"to\":\"${{ secrets.SAIKI_LINE_UID }}\",\"messages\":[{\"type\":\"text\",\"text\":\"✅ ${{ matrix.client.name }} 復旧しました\n\n自動再デプロイで回復しました。\"}]}"
+            -d "{\"to\":\"${{ secrets.SAIKI_LINE_UID }}\",\"messages\":[{\"type\":\"text\",\"text\":\"${CLIENT} 復旧しました\n\n自動再デプロイで回復しました。\"}]}"
 
-      - name: 復旧失敗（手動対応必要）
-        if: >
-          steps.check.outputs.http_code != '200' &&
-          steps.recovery.outputs.http_code != '200'
+      - name: Notify manual action needed
+        if: steps.check.outputs.http_code != '200' && steps.recovery.outputs.http_code != '200'
         run: |
-          MSG="🚨 ${{ matrix.client.name }} 自動復旧失敗
-
-再デプロイ後も応答なし。手動確認が必要です。
-Railway: https://railway.app"
+          CLIENT="${{ matrix.client.label }}"
+          CODE="${{ steps.recovery.outputs.http_code }}"
+          MSG="${CLIENT} 自動復旧失敗\n\n再デプロイ後も応答なし。手動確認が必要です。\nRailway: https://railway.app\nHTTP: ${CODE}"
           curl -s -X POST https://api.line.me/v2/bot/message/push \
             -H "Authorization: Bearer ${{ secrets.MONITORING_LINE_TOKEN }}" \
             -H "Content-Type: application/json" \
-            -d "{\"to\":\"${{ secrets.SAIKI_LINE_UID }}\",\"messages\":[{\"type\":\"text\",\"text\":\"$MSG\"}]}"
+            -d "{\"to\":\"${{ secrets.SAIKI_LINE_UID }}\",\"messages\":[{\"type\":\"text\",\"text\":\"${MSG}\"}]}"
           exit 1
